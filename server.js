@@ -4,13 +4,19 @@ import { chromium } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS
+// ===== CORS =====
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
   next();
 });
 
+// ===== HEALTH (per UptimeRobot) =====
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
+
+// ===== Playwright browser (riutilizzato) =====
 let browser = null;
 let context = null;
 
@@ -18,7 +24,7 @@ async function ensureBrowser() {
   if (browser && context) return;
 
   browser = await chromium.launch({
-    headless: true, // se blocca, prova headless:false
+    headless: true,
   });
 
   context = await browser.newContext({
@@ -26,6 +32,9 @@ async function ensureBrowser() {
     viewport: { width: 1280, height: 720 },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
+    extraHTTPHeaders: {
+      "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+    },
   });
 }
 
@@ -34,9 +43,37 @@ function stripQuery(u) {
 }
 
 function getPublicBase(req) {
+  // forza https (Render sta già in https)
   return `https://${req.get("host")}`;
 }
 
+// ===== Cache immagini in RAM (veloce) =====
+const IMG_CACHE = new Map(); // src -> { buf, ct, t }
+const IMG_TTL_MS = 1000 * 60 * 60 * 6; // 6 ore
+const IMG_MAX = 500; // quante immagini max in RAM
+
+function cacheGet(key) {
+  const v = IMG_CACHE.get(key);
+  if (!v) return null;
+  if (Date.now() - v.t > IMG_TTL_MS) {
+    IMG_CACHE.delete(key);
+    return null;
+  }
+  // refresh LRU
+  IMG_CACHE.delete(key);
+  IMG_CACHE.set(key, v);
+  return v;
+}
+
+function cacheSet(key, value) {
+  IMG_CACHE.set(key, value);
+  while (IMG_CACHE.size > IMG_MAX) {
+    const firstKey = IMG_CACHE.keys().next().value;
+    IMG_CACHE.delete(firstKey);
+  }
+}
+
+// ===== API: estrae immagini small.jpeg e costruisce URL proxy /img =====
 app.get("/api/yupoo", async (req, res) => {
   const albumUrl = req.query.url;
   if (!albumUrl) return res.status(400).json({ error: "Missing url" });
@@ -46,20 +83,23 @@ app.get("/api/yupoo", async (req, res) => {
 
     const page = await context.newPage();
     await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(900);
 
     const urls = await page.evaluate(() => {
       const out = new Set();
+
       document.querySelectorAll("img").forEach((img) => {
         const src = img.getAttribute("src");
         const ds = img.getAttribute("data-src");
         if (src) out.add(src);
         if (ds) out.add(ds);
       });
+
       document.querySelectorAll("a").forEach((a) => {
         const href = a.getAttribute("href");
         if (href) out.add(href);
       });
+
       return Array.from(out);
     });
 
@@ -76,6 +116,7 @@ app.get("/api/yupoo", async (req, res) => {
       })
       .filter(Boolean);
 
+    // SOLO small.jpeg (come vuoi tu)
     const imagesRaw = Array.from(
       new Set(
         absolute
@@ -85,8 +126,6 @@ app.get("/api/yupoo", async (req, res) => {
     );
 
     const publicBase = getPublicBase(req);
-
-    // NOTA: qui NON ci serve più lo skip warning perché ora scarichiamo via fetch nel componente
     const images = imagesRaw.map(
       (u) => `${publicBase}/img?src=${encodeURIComponent(u)}`
     );
@@ -98,9 +137,18 @@ app.get("/api/yupoo", async (req, res) => {
   }
 });
 
+// ===== Proxy immagine con cache =====
 app.get("/img", async (req, res) => {
   const src = req.query.src;
   if (!src) return res.status(400).send("Missing src");
+
+  // 1) cache RAM
+  const cached = cacheGet(src);
+  if (cached) {
+    res.setHeader("Content-Type", cached.ct);
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+    return res.send(cached.buf);
+  }
 
   try {
     await ensureBrowser();
@@ -116,6 +164,7 @@ app.get("/img", async (req, res) => {
     const ct = r.headers()["content-type"] || "image/jpeg";
     const buf = Buffer.from(await r.body());
 
+    // se upstream manda HTML (Restricted Access)
     if (
       ct.includes("text/html") ||
       buf.slice(0, 60).toString().includes("<!DOCTYPE")
@@ -123,12 +172,18 @@ app.get("/img", async (req, res) => {
       return res.status(403).send("Blocked by upstream (Restricted Access).");
     }
 
+    // 2) salva in cache RAM
+    cacheSet(src, { buf, ct, t: Date.now() });
+
+    // 3) cache lato browser
     res.setHeader("Content-Type", ct);
-    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     return res.send(buf);
   } catch (e) {
     return res.status(500).send(String(e));
   }
 });
 
-app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`API running on http://localhost:${PORT}`);
+});
