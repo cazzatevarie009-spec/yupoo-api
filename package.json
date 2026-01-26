@@ -2,13 +2,14 @@
   "name": "yupoo-api",
   "version": "1.0.0",
   "type": "module",
-  "main": "server.js",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "^1.50.0"
+    "playwright": "^1.42.0",
+    "@upstash/redis": "^1.35.0"
   }
 }
