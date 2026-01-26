@@ -1,8 +1,18 @@
 import express from "express";
 import { chromium } from "playwright";
+import { Redis } from "@upstash/redis";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ====== UPSTASH REDIS ======
+const redis =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? new Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+      })
+    : null;
 
 // ===== CORS =====
 app.use((req, res, next) => {
@@ -11,11 +21,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== HEALTH =====
 app.get("/health", (req, res) => res.status(200).send("ok"));
 app.head("/health", (req, res) => res.status(200).end());
 
-// ===== Playwright context =====
+// ===== Playwright =====
 let browser = null;
 let context = null;
 
@@ -25,8 +34,6 @@ async function ensureBrowser() {
   context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
-    locale: "en-US",
-    extraHTTPHeaders: { "Accept-Language": "en-US,en;q=0.9" },
   });
 }
 
@@ -36,22 +43,8 @@ function stripQuery(u) {
 function publicBase(req) {
   return `https://${req.get("host")}`;
 }
-
-// ===== Cache album 24h =====
-const CACHE = new Map(); // albumUrl -> { images, t }
-const TTL = 1000 * 60 * 60 * 24;
-
-function cacheGet(url) {
-  const v = CACHE.get(url);
-  if (!v) return null;
-  if (Date.now() - v.t > TTL) {
-    CACHE.delete(url);
-    return null;
-  }
-  return v.images;
-}
-function cacheSet(url, images) {
-  CACHE.set(url, { images, t: Date.now() });
+function cacheKey(albumUrl) {
+  return `album:${albumUrl}`;
 }
 
 // ===== Extract small.jpeg =====
@@ -59,7 +52,7 @@ async function extractSmall(albumUrl) {
   await ensureBrowser();
   const page = await context.newPage();
   await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(700);
 
   const urls = await page.evaluate(() => {
     const out = new Set();
@@ -85,57 +78,74 @@ async function extractSmall(albumUrl) {
     })
     .filter(Boolean);
 
-  const images = Array.from(
+  return Array.from(
     new Set(
       abs
         .map(stripQuery)
         .filter((u) => u.toLowerCase().endsWith("small.jpeg"))
     )
   );
-
-  return images;
 }
 
-// ===== API: torna SEMPRE "images" + direct + proxy =====
+// ===== API =====
 app.get("/api/yupoo", async (req, res) => {
   const albumUrl = req.query.url;
   if (!albumUrl) return res.status(400).json({ error: "Missing url" });
 
   try {
-    let images = cacheGet(albumUrl);
-    if (!images) {
-      images = await extractSmall(albumUrl);
-      cacheSet(albumUrl, images);
+    // 1) Redis cache (persistente) → velocissimo SEMPRE
+    if (redis) {
+      const cached = await redis.get(cacheKey(albumUrl));
+      if (cached && Array.isArray(cached) && cached.length) {
+        const base = publicBase(req);
+        const imagesDirect = cached;
+        const imagesProxy = cached.map(
+          (u) => `${base}/img?src=${encodeURIComponent(u)}`
+        );
+
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        return res.json({
+          images: cached,
+          imagesDirect,
+          imagesProxy,
+          cached: true,
+        });
+      }
+    }
+
+    // 2) Se non è in Redis, scrape UNA VOLTA
+    const images = await extractSmall(albumUrl);
+
+    // salva su Redis per le prossime volte (24h/7d come vuoi)
+    if (redis && images.length) {
+      await redis.set(cacheKey(albumUrl), images, { ex: 60 * 60 * 24 * 7 }); // 7 giorni
     }
 
     const base = publicBase(req);
-
     const imagesDirect = images;
     const imagesProxy = images.map(
       (u) => `${base}/img?src=${encodeURIComponent(u)}`
     );
 
-    // per compatibilità con component vecchi:
     res.setHeader("Cache-Control", "public, max-age=3600");
     return res.json({
-      images, // ✅ sempre presente
+      images,
       imagesDirect,
       imagesProxy,
-      count: images.length,
+      cached: false,
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
 });
 
-// ===== Proxy immagine (fallback) =====
+// ===== Proxy (fallback) =====
 app.get("/img", async (req, res) => {
   const src = req.query.src;
   if (!src) return res.status(400).send("Missing src");
 
   try {
     await ensureBrowser();
-
     const r = await context.request.get(src, {
       headers: {
         Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
@@ -147,7 +157,6 @@ app.get("/img", async (req, res) => {
     const ct = r.headers()["content-type"] || "image/jpeg";
     const buf = Buffer.from(await r.body());
 
-    // se torna html "Restricted Access"
     if (
       ct.includes("text/html") ||
       buf.slice(0, 60).toString().includes("<!DOCTYPE")
@@ -156,7 +165,7 @@ app.get("/img", async (req, res) => {
     }
 
     res.setHeader("Content-Type", ct);
-    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     return res.send(buf);
   } catch (e) {
     return res.status(500).send(String(e));
