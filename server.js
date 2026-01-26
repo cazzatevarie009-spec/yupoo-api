@@ -11,10 +11,9 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== HEALTH (per UptimeRobot) =====
-app.get("/health", (req, res) => {
-  res.status(200).send("ok");
-});
+// ===== HEALTH (UptimeRobot) =====
+app.get("/health", (req, res) => res.status(200).send("ok"));
+app.head("/health", (req, res) => res.status(200).end());
 
 // ===== Playwright browser (riutilizzato) =====
 let browser = null;
@@ -23,9 +22,7 @@ let context = null;
 async function ensureBrowser() {
   if (browser && context) return;
 
-  browser = await chromium.launch({
-    headless: true,
-  });
+  browser = await chromium.launch({ headless: true });
 
   context = await browser.newContext({
     locale: "en-US",
@@ -43,14 +40,13 @@ function stripQuery(u) {
 }
 
 function getPublicBase(req) {
-  // forza https (Render sta già in https)
   return `https://${req.get("host")}`;
 }
 
 // ===== Cache immagini in RAM (veloce) =====
 const IMG_CACHE = new Map(); // src -> { buf, ct, t }
 const IMG_TTL_MS = 1000 * 60 * 60 * 6; // 6 ore
-const IMG_MAX = 500; // quante immagini max in RAM
+const IMG_MAX = 800; // aumenta se vuoi (RAM permitting)
 
 function cacheGet(key) {
   const v = IMG_CACHE.get(key);
@@ -73,57 +69,86 @@ function cacheSet(key, value) {
   }
 }
 
-// ===== API: estrae immagini small.jpeg e costruisce URL proxy /img =====
+// ===== Cache album (lista small.jpeg) =====
+const ALBUM_CACHE = new Map(); // albumUrl -> { imagesRaw, t }
+const ALBUM_TTL_MS = 1000 * 60 * 30; // 30 min
+
+function albumGet(albumUrl) {
+  const v = ALBUM_CACHE.get(albumUrl);
+  if (!v) return null;
+  if (Date.now() - v.t > ALBUM_TTL_MS) {
+    ALBUM_CACHE.delete(albumUrl);
+    return null;
+  }
+  return v.imagesRaw;
+}
+
+function albumSet(albumUrl, imagesRaw) {
+  ALBUM_CACHE.set(albumUrl, { imagesRaw, t: Date.now() });
+}
+
+// ===== Estrae immagini small.jpeg dall'album (Playwright) =====
+async function extractSmallJpegs(albumUrl) {
+  await ensureBrowser();
+
+  const page = await context.newPage();
+  await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(900);
+
+  const urls = await page.evaluate(() => {
+    const out = new Set();
+    document.querySelectorAll("img").forEach((img) => {
+      const src = img.getAttribute("src");
+      const ds = img.getAttribute("data-src");
+      if (src) out.add(src);
+      if (ds) out.add(ds);
+    });
+    document.querySelectorAll("a").forEach((a) => {
+      const href = a.getAttribute("href");
+      if (href) out.add(href);
+    });
+    return Array.from(out);
+  });
+
+  await page.close();
+
+  const base = new URL(albumUrl);
+  const absolute = urls
+    .map((u) => {
+      try {
+        return new URL(u, base).toString();
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  // SOLO small.jpeg
+  const imagesRaw = Array.from(
+    new Set(
+      absolute
+        .map(stripQuery)
+        .filter((u) => u.toLowerCase().endsWith("small.jpeg"))
+    )
+  );
+
+  return imagesRaw;
+}
+
+// ===== API: restituisce lista proxy /img =====
 app.get("/api/yupoo", async (req, res) => {
   const albumUrl = req.query.url;
   if (!albumUrl) return res.status(400).json({ error: "Missing url" });
 
   try {
-    await ensureBrowser();
+    // 1) cache lista album
+    let imagesRaw = albumGet(albumUrl);
 
-    const page = await context.newPage();
-    await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await page.waitForTimeout(900);
-
-    const urls = await page.evaluate(() => {
-      const out = new Set();
-
-      document.querySelectorAll("img").forEach((img) => {
-        const src = img.getAttribute("src");
-        const ds = img.getAttribute("data-src");
-        if (src) out.add(src);
-        if (ds) out.add(ds);
-      });
-
-      document.querySelectorAll("a").forEach((a) => {
-        const href = a.getAttribute("href");
-        if (href) out.add(href);
-      });
-
-      return Array.from(out);
-    });
-
-    await page.close();
-
-    const base = new URL(albumUrl);
-    const absolute = urls
-      .map((u) => {
-        try {
-          return new URL(u, base).toString();
-        } catch {
-          return null;
-        }
-      })
-      .filter(Boolean);
-
-    // SOLO small.jpeg (come vuoi tu)
-    const imagesRaw = Array.from(
-      new Set(
-        absolute
-          .map(stripQuery)
-          .filter((u) => u.toLowerCase().endsWith("small.jpeg"))
-      )
-    );
+    // 2) se non c'è cache, estrai con Playwright
+    if (!imagesRaw) {
+      imagesRaw = await extractSmallJpegs(albumUrl);
+      albumSet(albumUrl, imagesRaw);
+    }
 
     const publicBase = getPublicBase(req);
     const images = imagesRaw.map(
@@ -137,12 +162,70 @@ app.get("/api/yupoo", async (req, res) => {
   }
 });
 
-// ===== Proxy immagine con cache =====
+// ===== Prefetch: scalda cache immagini (scarica le small) =====
+app.get("/prefetch", async (req, res) => {
+  const albumUrl = req.query.url;
+  if (!albumUrl) return res.status(400).json({ error: "Missing url" });
+
+  const limit = Math.min(parseInt(req.query.limit || "40", 10), 120);
+  const CONCURRENCY = 6;
+
+  try {
+    let imagesRaw = albumGet(albumUrl);
+    if (!imagesRaw) {
+      imagesRaw = await extractSmallJpegs(albumUrl);
+      albumSet(albumUrl, imagesRaw);
+    }
+
+    const toFetch = imagesRaw.slice(0, limit);
+    let ok = 0;
+
+    for (let i = 0; i < toFetch.length; i += CONCURRENCY) {
+      const batch = toFetch.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (src) => {
+          if (cacheGet(src)) return true;
+          try {
+            await ensureBrowser();
+            const r = await context.request.get(src, {
+              headers: {
+                Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                Referer: "https://hotdog-official.x.yupoo.com/",
+              },
+              timeout: 60000,
+            });
+
+            const ct = r.headers()["content-type"] || "image/jpeg";
+            const buf = Buffer.from(await r.body());
+
+            if (
+              ct.includes("text/html") ||
+              buf.slice(0, 60).toString().includes("<!DOCTYPE")
+            )
+              return false;
+
+            cacheSet(src, { buf, ct, t: Date.now() });
+            return true;
+          } catch {
+            return false;
+          }
+        })
+      );
+      ok += results.filter(Boolean).length;
+    }
+
+    return res.json({ prefetched: ok, total: toFetch.length });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+// ===== Proxy immagine (con cache RAM + cache browser) =====
 app.get("/img", async (req, res) => {
   const src = req.query.src;
   if (!src) return res.status(400).send("Missing src");
 
-  // 1) cache RAM
+  // cache RAM
   const cached = cacheGet(src);
   if (cached) {
     res.setHeader("Content-Type", cached.ct);
@@ -164,7 +247,6 @@ app.get("/img", async (req, res) => {
     const ct = r.headers()["content-type"] || "image/jpeg";
     const buf = Buffer.from(await r.body());
 
-    // se upstream manda HTML (Restricted Access)
     if (
       ct.includes("text/html") ||
       buf.slice(0, 60).toString().includes("<!DOCTYPE")
@@ -172,10 +254,8 @@ app.get("/img", async (req, res) => {
       return res.status(403).send("Blocked by upstream (Restricted Access).");
     }
 
-    // 2) salva in cache RAM
     cacheSet(src, { buf, ct, t: Date.now() });
 
-    // 3) cache lato browser
     res.setHeader("Content-Type", ct);
     res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     return res.send(buf);
@@ -184,6 +264,4 @@ app.get("/img", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`API running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
