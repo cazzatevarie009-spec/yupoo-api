@@ -22,7 +22,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== HEALTH / VERSION =====
 app.get("/health", (req, res) => res.status(200).send("ok"));
 app.head("/health", (req, res) => res.status(200).end());
 
@@ -30,7 +29,7 @@ app.get("/version", (req, res) => {
   res.json({
     updated: true,
     time: new Date().toISOString(),
-    note: "yupoo multi-host + resource-scan (performance entries)",
+    note: "progressive yupoo (redis set) + background scrape",
   });
 });
 
@@ -47,154 +46,138 @@ async function ensureBrowser() {
   });
 }
 
-function stripQuery(u) {
-  return u.split("?")[0];
-}
+// ===== In-memory running jobs (per evitare doppio scrape) =====
+const RUNNING = new Set(); // albumUrl strings
+
+// ===== Utils =====
 function publicBase(req) {
   return `https://${req.get("host")}`;
 }
-function cacheKey(albumUrl) {
-  return `album:${albumUrl}`;
+function stripQuery(u) {
+  return u.split("?")[0];
 }
-function getRefererFromUrl(u) {
-  try {
-    const x = new URL(u);
-    return `${x.protocol}//${x.hostname}/`;
-  } catch {
-    return "https://yupoo.com/";
-  }
-}
-
-// accetta small.* con estensioni comuni (su alcuni yupoo non è small.jpeg)
-function isSmallImageUrl(u) {
+function isSmall(u) {
   const s = u.toLowerCase();
   return (
-    (s.includes("small.") || s.includes("/small")) &&
+    s.includes("small.") &&
     (s.includes(".jpeg") || s.includes(".jpg") || s.includes(".png") || s.includes(".webp"))
   );
 }
 
-// ===== Extract SMALL (robust): prende risorse caricate dal browser =====
-async function extractSmall(albumUrl) {
-  await ensureBrowser();
-  const page = await context.newPage();
-
-  await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  // aspetta che yupoo faccia le chiamate e carichi immagini
-  // networkidle a volte non arriva, quindi usiamo entrambi: breve wait + scroll
-  try {
-    await page.waitForLoadState("networkidle", { timeout: 8000 });
-  } catch {}
-  await page.waitForTimeout(1200);
-
-  // scroll per triggerare lazy-load
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await page.waitForTimeout(900);
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await page.waitForTimeout(500);
-
-  // 1) tutte le risorse caricate (images incluse)
-  const resources = await page.evaluate(() => {
-    try {
-      return performance
-        .getEntriesByType("resource")
-        .map((e) => e.name)
-        .filter(Boolean);
-    } catch {
-      return [];
-    }
-  });
-
-  // 2) fallback: anche src/data-src nel DOM (alcuni yupoo li hanno)
-  const domUrls = await page.evaluate(() => {
-    const out = new Set();
-    document.querySelectorAll("img").forEach((img) => {
-      const s = img.getAttribute("src");
-      const ds = img.getAttribute("data-src");
-      const srcset = img.getAttribute("srcset");
-      if (s) out.add(s);
-      if (ds) out.add(ds);
-      if (srcset) srcset.split(",").forEach((p) => out.add(p.trim().split(" ")[0]));
-    });
-    return Array.from(out);
-  });
-
-  // 3) fallback ulteriore: scan HTML per link small.*
-  const html = await page.content();
-
-  await page.close();
-
-  const htmlMatches =
-    html.match(/https?:\/\/[^"'\\\s]+?\bsmall\.[a-z0-9]{3,5}\b/gi) || [];
-  const htmlMatches2 =
-    html.match(/\/\/[^"'\\\s]+?\bsmall\.[a-z0-9]{3,5}\b/gi) || [];
-  const fixed2 = htmlMatches2.map((u) => "https:" + u);
-
-  const base = new URL(albumUrl);
-
-  const all = [...resources, ...domUrls, ...htmlMatches, ...fixed2]
-    .map((u) => {
-      try {
-        return new URL(u, base).toString();
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean)
-    .map(stripQuery);
-
-  const filtered = all.filter(isSmallImageUrl);
-
-  return Array.from(new Set(filtered));
+// Redis keys
+function setKey(albumUrl) {
+  return `albumset:${albumUrl}`;
+}
+function doneKey(albumUrl) {
+  return `albumdone:${albumUrl}`;
 }
 
-// ===== API =====
-app.get("/api/yupoo", async (req, res) => {
-  const albumUrl = req.query.url;
-  if (!albumUrl) return res.status(400).json({ error: "Missing url" });
+// ===== Scrape progressivo: intercetta risorse mentre carica =====
+async function scrapeAlbumProgressive(albumUrl) {
+  if (!redis) return; // senza redis non ha senso progressivo persistente
+  if (RUNNING.has(albumUrl)) return;
+
+  RUNNING.add(albumUrl);
 
   try {
-    // cache redis
-    if (redis) {
-      const cached = await redis.get(cacheKey(albumUrl));
-      if (cached && Array.isArray(cached) && cached.length) {
-        const base = publicBase(req);
-        const imagesProxy = cached.map(
-          (u) => `${base}/img?src=${encodeURIComponent(u)}`
-        );
-        res.setHeader("Cache-Control", "public, max-age=86400");
-        return res.json({
-          images: imagesProxy,
-          cached: true,
-          count: cached.length,
-        });
+    await ensureBrowser();
+    const page = await context.newPage();
+
+    // ogni volta che una response arriva, prendiamo la url (se small)
+    page.on("response", async (resp) => {
+      try {
+        const u = stripQuery(resp.url());
+        if (!isSmall(u)) return;
+        await redis.sadd(setKey(albumUrl), u);
+        // tieni 7 giorni
+        await redis.expire(setKey(albumUrl), 60 * 60 * 24 * 7);
+      } catch {}
+    });
+
+    await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+    // aspetta un po' che yupoo faccia le sue chiamate
+    try {
+      await page.waitForLoadState("networkidle", { timeout: 8000 });
+    } catch {}
+    await page.waitForTimeout(1200);
+
+    // scroll per trigger lazy-load
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(1200);
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(600);
+
+    // fallback finale: performance resources (prende ciò che è stato caricato)
+    try {
+      const perf = await page.evaluate(() => {
+        try {
+          return performance.getEntriesByType("resource").map((e) => e.name).filter(Boolean);
+        } catch {
+          return [];
+        }
+      });
+      for (const u0 of perf) {
+        const u = stripQuery(u0);
+        if (isSmall(u)) {
+          await redis.sadd(setKey(albumUrl), u);
+        }
       }
+      await redis.expire(setKey(albumUrl), 60 * 60 * 24 * 7);
+    } catch {}
+
+    await page.close();
+
+    // marca done
+    await redis.set(doneKey(albumUrl), "1", { ex: 60 * 60 * 24 * 7 });
+  } catch (e) {
+    // se fallisce, non blocchiamo per sempre: rilascia lock e lascia done assente
+  } finally {
+    RUNNING.delete(albumUrl);
+  }
+}
+
+// ===== PROGRESS ENDPOINT =====
+// Risponde subito con quello che c'è in Redis, e se non è "done" avvia background scrape.
+app.get("/api/yupoo/progress", async (req, res) => {
+  const albumUrl = req.query.url;
+  const limit = Math.min(parseInt(req.query.limit || "300", 10) || 300, 800);
+
+  if (!albumUrl) return res.status(400).json({ error: "Missing url" });
+  if (!redis) return res.status(500).json({ error: "Redis not configured" });
+
+  try {
+    // avvia scrape se non done e non running
+    const done = (await redis.get(doneKey(albumUrl))) === "1";
+    if (!done && !RUNNING.has(albumUrl)) {
+      setTimeout(() => {
+        scrapeAlbumProgressive(albumUrl);
+      }, 0);
     }
 
-    const images = await extractSmall(albumUrl);
+    // leggi set immagini
+    const originals = (await redis.smembers(setKey(albumUrl))) || [];
+    // stabile: ordina per stringa (non perfetto, ma stabile)
+    originals.sort();
 
-    if (redis && images.length) {
-      await redis.set(cacheKey(albumUrl), images, { ex: 60 * 60 * 24 * 7 });
-    }
-
+    const sliced = originals.slice(0, limit);
     const base = publicBase(req);
-    const imagesProxy = images.map(
-      (u) => `${base}/img?src=${encodeURIComponent(u)}`
-    );
 
-    res.setHeader("Cache-Control", "public, max-age=3600");
+    const proxies = sliced.map((u) => `${base}/img?src=${encodeURIComponent(u)}`);
+
     return res.json({
-      images: imagesProxy,
-      cached: false,
-      count: images.length,
+      done,
+      cached: originals.length > 0,
+      count: originals.length,
+      imagesOriginal: sliced,
+      imagesProxy: proxies,
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
 });
 
-// ===== Proxy immagini (bypassa Restricted Access) =====
+// ===== Proxy immagini (bypassa restricted access) =====
 app.get("/img", async (req, res) => {
   const src = req.query.src;
   if (!src) return res.status(400).send("Missing src");
@@ -202,9 +185,14 @@ app.get("/img", async (req, res) => {
   try {
     await ensureBrowser();
 
-    const referer = getRefererFromUrl(src);
+    // referer dinamico dal dominio della risorsa
+    let referer = "https://yupoo.com/";
+    try {
+      const u = new URL(String(src));
+      referer = `${u.protocol}//${u.hostname}/`;
+    } catch {}
 
-    const r = await context.request.get(src, {
+    const r = await context.request.get(String(src), {
       headers: {
         Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         Referer: referer,
