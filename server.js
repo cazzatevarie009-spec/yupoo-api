@@ -22,16 +22,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== HEALTH =====
+// ===== HEALTH / VERSION =====
 app.get("/health", (req, res) => res.status(200).send("ok"));
 app.head("/health", (req, res) => res.status(200).end());
 
-// (opzionale) per capire al 100% che versione sta girando su Render
 app.get("/version", (req, res) => {
   res.json({
     updated: true,
     time: new Date().toISOString(),
-    note: "multi-yupoo + robust html regex small.jpeg",
+    note: "yupoo multi-host + resource-scan (performance entries)",
   });
 });
 
@@ -57,39 +56,97 @@ function publicBase(req) {
 function cacheKey(albumUrl) {
   return `album:${albumUrl}`;
 }
-function getRefererFromImage(src) {
-  // Referer dinamico in base all'hostname dell'immagine (hotdog/elephant/goat ecc)
-  const u = new URL(src);
-  return `${u.protocol}//${u.hostname}/`;
+function getRefererFromUrl(u) {
+  try {
+    const x = new URL(u);
+    return `${x.protocol}//${x.hostname}/`;
+  } catch {
+    return "https://yupoo.com/";
+  }
 }
 
-// ===== Extract small.jpeg (ROBUSTO) =====
-// - Funziona anche quando Yupoo non mette i link dentro <img src> / data-src
-// - Cerca direttamente nell'HTML (include script inline) con regex
+// accetta small.* con estensioni comuni (su alcuni yupoo non è small.jpeg)
+function isSmallImageUrl(u) {
+  const s = u.toLowerCase();
+  return (
+    (s.includes("small.") || s.includes("/small")) &&
+    (s.includes(".jpeg") || s.includes(".jpg") || s.includes(".png") || s.includes(".webp"))
+  );
+}
+
+// ===== Extract SMALL (robust): prende risorse caricate dal browser =====
 async function extractSmall(albumUrl) {
   await ensureBrowser();
   const page = await context.newPage();
 
-  await page.goto(albumUrl, {
-    waitUntil: "domcontentloaded",
-    timeout: 60000,
-  });
+  await page.goto(albumUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
-  // aspetta un attimo (alcuni yupoo popolano script/markup dopo il load)
+  // aspetta che yupoo faccia le chiamate e carichi immagini
+  // networkidle a volte non arriva, quindi usiamo entrambi: breve wait + scroll
+  try {
+    await page.waitForLoadState("networkidle", { timeout: 8000 });
+  } catch {}
   await page.waitForTimeout(1200);
 
+  // scroll per triggerare lazy-load
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.waitForTimeout(900);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(500);
+
+  // 1) tutte le risorse caricate (images incluse)
+  const resources = await page.evaluate(() => {
+    try {
+      return performance
+        .getEntriesByType("resource")
+        .map((e) => e.name)
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  });
+
+  // 2) fallback: anche src/data-src nel DOM (alcuni yupoo li hanno)
+  const domUrls = await page.evaluate(() => {
+    const out = new Set();
+    document.querySelectorAll("img").forEach((img) => {
+      const s = img.getAttribute("src");
+      const ds = img.getAttribute("data-src");
+      const srcset = img.getAttribute("srcset");
+      if (s) out.add(s);
+      if (ds) out.add(ds);
+      if (srcset) srcset.split(",").forEach((p) => out.add(p.trim().split(" ")[0]));
+    });
+    return Array.from(out);
+  });
+
+  // 3) fallback ulteriore: scan HTML per link small.*
   const html = await page.content();
+
   await page.close();
 
-  // link completi: https://...small.jpeg
-  const matches = html.match(/https?:\/\/[^"'\\\s]+small\.jpeg/gi) || [];
+  const htmlMatches =
+    html.match(/https?:\/\/[^"'\\\s]+?\bsmall\.[a-z0-9]{3,5}\b/gi) || [];
+  const htmlMatches2 =
+    html.match(/\/\/[^"'\\\s]+?\bsmall\.[a-z0-9]{3,5}\b/gi) || [];
+  const fixed2 = htmlMatches2.map((u) => "https:" + u);
 
-  // link protocol-relative: //photo.yupoo.com/...small.jpeg
-  const matches2 = html.match(/\/\/[^"'\\\s]+small\.jpeg/gi) || [];
-  const fixed2 = matches2.map((u) => "https:" + u);
+  const base = new URL(albumUrl);
 
-  // de-dup + rimuove querystring
-  return Array.from(new Set([...matches, ...fixed2].map(stripQuery)));
+  const all = [...resources, ...domUrls, ...htmlMatches, ...fixed2]
+    .map((u) => {
+      try {
+        return new URL(u, base).toString();
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .map(stripQuery);
+
+  const filtered = all.filter(isSmallImageUrl);
+
+  return Array.from(new Set(filtered));
 }
 
 // ===== API =====
@@ -98,7 +155,7 @@ app.get("/api/yupoo", async (req, res) => {
   if (!albumUrl) return res.status(400).json({ error: "Missing url" });
 
   try {
-    // 1) Redis cache (persistente) → velocissimo
+    // cache redis
     if (redis) {
       const cached = await redis.get(cacheKey(albumUrl));
       if (cached && Array.isArray(cached) && cached.length) {
@@ -106,20 +163,17 @@ app.get("/api/yupoo", async (req, res) => {
         const imagesProxy = cached.map(
           (u) => `${base}/img?src=${encodeURIComponent(u)}`
         );
-
         res.setHeader("Cache-Control", "public, max-age=86400");
         return res.json({
-          images: imagesProxy, // usa sempre proxy (evita Restricted Access)
+          images: imagesProxy,
           cached: true,
           count: cached.length,
         });
       }
     }
 
-    // 2) Se non è in Redis, scrape una volta
     const images = await extractSmall(albumUrl);
 
-    // salva su Redis (7 giorni)
     if (redis && images.length) {
       await redis.set(cacheKey(albumUrl), images, { ex: 60 * 60 * 24 * 7 });
     }
@@ -148,12 +202,12 @@ app.get("/img", async (req, res) => {
   try {
     await ensureBrowser();
 
-    const referer = getRefererFromImage(src);
+    const referer = getRefererFromUrl(src);
 
     const r = await context.request.get(src, {
       headers: {
         Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        Referer: referer, // dinamico: hotdog/elephant/goat ecc
+        Referer: referer,
       },
       timeout: 60000,
     });
@@ -161,10 +215,9 @@ app.get("/img", async (req, res) => {
     const ct = r.headers()["content-type"] || "image/jpeg";
     const buf = Buffer.from(await r.body());
 
-    // se yupoo ti blocca e ti manda HTML
     if (
       ct.includes("text/html") ||
-      buf.slice(0, 80).toString().toLowerCase().includes("<!doctype")
+      buf.slice(0, 120).toString().toLowerCase().includes("<!doctype")
     ) {
       return res.status(403).send("Blocked by upstream.");
     }
