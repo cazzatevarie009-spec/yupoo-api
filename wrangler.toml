@@ -1,0 +1,7 @@
+name = "qc-api"
+main = "worker.js"
+compatibility_date = "2025-02-05"
+
+kv_namespaces = [
+  { binding = "ALBUM_KV", id = "INSERISCI_ID_KV_QUI" }
+]
